@@ -1046,3 +1046,36 @@ fn test_lockstep_recovers_after_repeated_stalls() -> Result<(), GgrsError> {
 
     Ok(())
 }
+
+#[test]
+#[serial]
+fn test_max_input_delay_sizes_the_input_queue() -> Result<(), GgrsError> {
+    let addr1 = stubs::localhost(7851);
+    let addr2 = stubs::localhost(7852);
+
+    let socket1 = UdpNonBlockingSocket::bind_to_port(7851).unwrap();
+    let mut declared = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Local, 0)?
+        .add_player(PlayerType::Remote(addr2), 1)?
+        .with_input_delay(2)
+        .with_max_input_delay(60)
+        .start_p2p_session(socket1)?;
+    declared.set_input_delay(0, 60)?;
+    assert!(matches!(
+        declared.set_input_delay(0, 200),
+        Err(GgrsError::InvalidRequest { .. })
+    ));
+
+    let socket2 = UdpNonBlockingSocket::bind_to_port(7852).unwrap();
+    let mut default = SessionBuilder::<StubConfig>::new()
+        .add_player(PlayerType::Remote(addr1), 0)?
+        .add_player(PlayerType::Local, 1)?
+        .with_input_delay(2)
+        .start_p2p_session(socket2)?;
+    assert!(matches!(
+        default.set_input_delay(1, 60),
+        Err(GgrsError::InvalidRequest { .. })
+    ));
+
+    Ok(())
+}

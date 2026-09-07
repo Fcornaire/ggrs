@@ -166,7 +166,8 @@ where
     T: Config,
 {
     num_players: usize,
-    max_prediction: usize,
+    /// How many past frames we retain states and inputs for, i.e. the deepest rollback we can serve.
+    max_rollback: usize,
     saved_states: SavedStates<T::State>,
     last_confirmed_frame: Frame,
     last_saved_frame: Frame,
@@ -176,25 +177,31 @@ where
 
 impl<T: Config> SyncLayer<T> {
     /// Creates a new `SyncLayer` instance with given values.
-    pub(crate) fn new(num_players: usize, max_prediction: usize) -> Self {
+    pub(crate) fn new(num_players: usize, max_rollback: usize, input_queue_len: usize) -> Self {
         // initialize input_queues
         let mut input_queues = Vec::new();
         for _ in 0..num_players {
-            input_queues.push(InputQueue::new());
+            input_queues.push(InputQueue::new(input_queue_len));
         }
         Self {
             num_players,
-            max_prediction,
+            max_rollback,
             last_confirmed_frame: NULL_FRAME,
             last_saved_frame: NULL_FRAME,
             current_frame: 0,
-            saved_states: SavedStates::new(max_prediction),
+            saved_states: SavedStates::new(max_rollback),
             input_queues,
         }
     }
 
     pub(crate) fn current_frame(&self) -> Frame {
         self.current_frame
+    }
+
+    pub(crate) fn input_queue_capacity(&self) -> usize {
+        self.input_queues
+            .first()
+            .map_or(0, |queue| queue.capacity())
     }
 
     pub(crate) fn advance_frame(&mut self) {
@@ -236,12 +243,12 @@ impl<T: Config> SyncLayer<T> {
             self.current_frame
         );
         assert!(
-            frame_to_load >= self.current_frame - self.max_prediction as i32,
-            "cannot load frame outside of prediction window; \
-            (frame to load is {}, current frame is {}, max prediction is {})",
+            frame_to_load >= self.current_frame - self.max_rollback as i32,
+            "cannot load frame outside of rollback window; \
+            (frame to load is {}, current frame is {}, rollback window is {})",
             frame_to_load,
             self.current_frame,
-            self.max_prediction
+            self.max_rollback
         );
 
         let cell = self.saved_states.get_cell(frame_to_load);
@@ -252,6 +259,25 @@ impl<T: Config> SyncLayer<T> {
             cell,
             frame: frame_to_load,
         }
+    }
+
+    /// Whether `frame` can still be rolled back to.
+    pub(crate) fn can_load_frame(&self, frame: Frame, connect_status: &[ConnectionStatus]) -> bool {
+        if frame == NULL_FRAME
+            || frame >= self.current_frame
+            || frame < self.current_frame - self.max_rollback as i32
+        {
+            return false;
+        }
+
+        if self.saved_states.get_cell(frame).frame() != frame {
+            return false;
+        }
+
+        connect_status.iter().enumerate().all(|(handle, status)| {
+            (status.disconnected && status.last_frame < frame)
+                || self.input_queues[handle].oldest_frame() <= frame
+        })
     }
 
     /// Adds local input to the corresponding input queue. Checks if the prediction threshold has been reached. Returns the frame number where the input is actually added to.
@@ -333,8 +359,10 @@ impl<T: Config> SyncLayer<T> {
 
         self.last_confirmed_frame = frame;
         if self.last_confirmed_frame > 0 {
+            let discard_to =
+                std::cmp::min(frame - 1, self.current_frame - self.max_rollback as i32);
             for i in 0..self.num_players {
-                self.input_queues[i].discard_confirmed_frames(frame - 1);
+                self.input_queues[i].discard_confirmed_frames(discard_to);
             }
         }
     }
@@ -403,6 +431,7 @@ impl<T: Config> SyncLayer<T> {
 mod sync_layer_tests {
 
     use super::*;
+    use crate::input_queue::INPUT_QUEUE_LENGTH;
     use crate::PredictRepeatLast;
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
@@ -479,7 +508,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_different_delays() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8, INPUT_QUEUE_LENGTH);
         let p1_delay = 2;
         let p2_delay = 0;
         sync_layer.set_frame_delay(0, p1_delay);
@@ -516,7 +545,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_advance_frame_increments_current_frame() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         assert_eq!(sync_layer.current_frame(), 0);
         sync_layer.advance_frame();
         assert_eq!(sync_layer.current_frame(), 1);
@@ -524,7 +553,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_save_current_state_updates_last_saved_frame() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         let req = sync_layer.save_current_state();
         assert_eq!(sync_layer.last_saved_frame(), 0);
         // fulfill the save request so the cell contains frame 0
@@ -535,13 +564,13 @@ mod sync_layer_tests {
 
     #[test]
     fn test_saved_state_by_frame_returns_none_before_save() {
-        let sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         assert!(sync_layer.saved_state_by_frame(0).is_none());
     }
 
     #[test]
     fn test_saved_state_by_frame_returns_some_after_save() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         let req = sync_layer.save_current_state();
         if let GgrsRequest::SaveGameState { cell, frame } = req {
             cell.save(frame, Some(7u8), None);
@@ -551,7 +580,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_latest_saved_state_in_range_returns_latest_matching_frame() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         for target_frame in [0, 4, 7] {
             while sync_layer.current_frame() < target_frame {
                 sync_layer.advance_frame();
@@ -574,7 +603,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_load_frame_rewinds_current_frame() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         // save frame 0
         let req = sync_layer.save_current_state();
         if let GgrsRequest::SaveGameState { cell, frame } = req {
@@ -592,7 +621,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_check_simulation_consistency_no_mismatch() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8, INPUT_QUEUE_LENGTH);
         let connect_status = make_connect_status(2);
         for i in 0..5 {
             let inp = PlayerInput::new(i, TestInput { inp: i as u8 });
@@ -609,7 +638,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_check_simulation_consistency_finds_mismatch() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         // Add frame 0, then request frame 1 to trigger a prediction
         sync_layer.add_remote_input(0, PlayerInput::new(0, TestInput { inp: 5 }));
         let connect_status = make_connect_status(1);
@@ -623,7 +652,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_set_last_confirmed_frame_updates_last_confirmed() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         for i in 0..10 {
             sync_layer.add_remote_input(0, PlayerInput::new(i, TestInput { inp: i as u8 }));
             sync_layer.advance_frame();
@@ -634,7 +663,7 @@ mod sync_layer_tests {
 
     #[test]
     fn test_set_last_confirmed_frame_sparse_saving_caps_at_last_saved() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
         // save frame 0
         let req = sync_layer.save_current_state();
         if let GgrsRequest::SaveGameState { cell, frame } = req {
@@ -651,8 +680,63 @@ mod sync_layer_tests {
     }
 
     #[test]
+    fn test_can_load_frame_respects_window_and_saved_states() {
+        // rollback window of 6 frames
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 6, INPUT_QUEUE_LENGTH);
+        let connect_status = make_connect_status(1);
+        for i in 0..10 {
+            let req = sync_layer.save_current_state();
+            if let GgrsRequest::SaveGameState { cell, frame } = req {
+                cell.save(frame, Some(frame as u8), None);
+            }
+            sync_layer.add_remote_input(0, PlayerInput::new(i, TestInput { inp: i as u8 }));
+            sync_layer.advance_frame();
+        }
+
+        // current frame is 10, the window covers 4..=9
+        assert!(sync_layer.can_load_frame(4, &connect_status));
+        assert!(sync_layer.can_load_frame(9, &connect_status));
+        assert!(!sync_layer.can_load_frame(3, &connect_status));
+        assert!(!sync_layer.can_load_frame(10, &connect_status));
+        assert!(!sync_layer.can_load_frame(NULL_FRAME, &connect_status));
+    }
+
+    #[test]
+    fn test_can_load_frame_needs_inputs_unless_player_is_disconnected_before() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 8, INPUT_QUEUE_LENGTH);
+        let mut connect_status = make_connect_status(1);
+        for i in 0..10 {
+            let req = sync_layer.save_current_state();
+            if let GgrsRequest::SaveGameState { cell, frame } = req {
+                cell.save(frame, Some(frame as u8), None);
+            }
+            sync_layer.add_remote_input(0, PlayerInput::new(i, TestInput { inp: i as u8 }));
+            sync_layer.advance_frame();
+        }
+        sync_layer.input_queues[0].discard_confirmed_frames(6);
+        assert!(!sync_layer.can_load_frame(4, &connect_status));
+        assert!(sync_layer.can_load_frame(6, &connect_status));
+
+        connect_status[0].disconnected = true;
+        connect_status[0].last_frame = 3;
+        assert!(sync_layer.can_load_frame(4, &connect_status));
+    }
+
+    #[test]
+    fn test_inputs_retained_across_rollback_window() {
+        let mut sync_layer = SyncLayer::<TestConfig>::new(1, 6, INPUT_QUEUE_LENGTH);
+        for i in 0..20 {
+            sync_layer.add_remote_input(0, PlayerInput::new(i, TestInput { inp: i as u8 }));
+            sync_layer.advance_frame();
+        }
+
+        sync_layer.set_last_confirmed_frame(20, false);
+        assert_eq!(sync_layer.input_queues[0].oldest_frame(), 14);
+    }
+
+    #[test]
     fn test_disconnected_player_returns_default_input() {
-        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8);
+        let mut sync_layer = SyncLayer::<TestConfig>::new(2, 8, INPUT_QUEUE_LENGTH);
         let mut connect_status = make_connect_status(2);
         // mark player 1 as disconnected before frame 0
         connect_status[1].disconnected = true;
