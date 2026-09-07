@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use instant::Duration;
 
 use crate::{
-    network::protocol::UdpProtocol, sessions::p2p_session::PlayerRegistry, Config, DesyncDetection,
-    GgrsError, NonBlockingSocket, P2PSession, PlayerHandle, PlayerType, SpectatorSession,
-    SyncTestSession,
+    input_queue::input_queue_length, network::protocol::UdpProtocol,
+    sessions::p2p_session::PlayerRegistry, Config, DesyncDetection, GgrsError, NonBlockingSocket,
+    P2PSession, PlayerHandle, PlayerType, SpectatorSession, SyncTestSession,
 };
 
 const DEFAULT_PLAYERS: usize = 2;
@@ -35,6 +35,10 @@ where
     num_players: usize,
     local_players: usize,
     max_prediction: usize,
+    /// Past frames retained for rollbacks
+    max_rollback: Option<usize>,
+    /// Largest input delay any peer will use
+    max_input_delay: Option<usize>,
     /// FPS defines the expected update frequency of this session.
     fps: usize,
     sparse_saving: bool,
@@ -65,6 +69,8 @@ impl<T: Config> SessionBuilder<T> {
             local_players: 0,
             num_players: DEFAULT_PLAYERS,
             max_prediction: DEFAULT_MAX_PREDICTION_FRAMES,
+            max_rollback: None,
+            max_input_delay: None,
             fps: DEFAULT_FPS,
             sparse_saving: DEFAULT_SAVE_MODE,
             desync_detection: DEFAULT_DETECTION_MODE,
@@ -157,6 +163,37 @@ impl<T: Config> SessionBuilder<T> {
     pub fn with_max_prediction_window(mut self, window: usize) -> Self {
         self.max_prediction = window;
         self
+    }
+
+    /// Change how many past frames the session retains for rollbacks. Default is the prediction
+    /// window.
+    ///
+    /// With three or more players, a peer can report a dropped player's last frame as older than
+    /// the frame we received ourselves. Converging on that frame means rolling back below our own
+    /// confirmed frame, possibly further than the prediction window. Retaining more frames makes
+    /// such disconnects recoverable.
+    pub fn with_max_rollback_window(mut self, window: usize) -> Self {
+        self.max_rollback = Some(window);
+        self
+    }
+
+    /// Declares the largest input delay any peer of this session will use.
+    /// Input queues are sized from it.
+    pub fn with_max_input_delay(mut self, delay: usize) -> Self {
+        self.max_input_delay = Some(delay);
+        self
+    }
+
+    fn input_queue_len(&self) -> usize {
+        let max_rollback = self
+            .max_rollback
+            .unwrap_or(self.max_prediction)
+            .max(self.max_prediction);
+        let max_input_delay = self
+            .max_input_delay
+            .unwrap_or(self.input_delay)
+            .max(self.input_delay);
+        input_queue_length(max_rollback, self.max_prediction, max_input_delay)
     }
 
     /// Change the amount of frames GGRS will delay the inputs for local players. Default is 0.
@@ -367,9 +404,12 @@ impl<T: Config> SessionBuilder<T> {
             }
         }
 
+        let input_queue_len = self.input_queue_len();
         Ok(P2PSession::<T>::new(
             self.num_players,
             self.max_prediction,
+            self.max_rollback.unwrap_or(self.max_prediction),
+            input_queue_len,
             Box::new(socket),
             self.player_reg,
             self.sparse_saving,
@@ -438,11 +478,13 @@ impl<T: Config> SessionBuilder<T> {
                 info: "Sparse saving is not supported for synctest sessions.".to_owned(),
             });
         }
+        let input_queue_len = self.input_queue_len();
         Ok(SyncTestSession::new(
             self.num_players,
             self.max_prediction,
             self.check_dist,
             self.input_delay,
+            input_queue_len,
         ))
     }
 

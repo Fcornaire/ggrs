@@ -342,6 +342,10 @@ impl<T: Config> UdpProtocol<T> {
         self.state == ProtocolState::Running
     }
 
+    pub(crate) fn is_disconnected(&self) -> bool {
+        self.state == ProtocolState::Disconnected || self.state == ProtocolState::Shutdown
+    }
+
     pub(crate) fn is_handling_message(&self, addr: &T::Address) -> bool {
         self.peer_addr == *addr
     }

@@ -1,5 +1,6 @@
 use crate::error::GgrsError;
 use crate::frame_info::PlayerInput;
+use crate::input_queue::input_queue_length;
 use crate::network::messages::ConnectionStatus;
 use crate::network::network_stats::NetworkStats;
 use crate::network::protocol::{InputBytes, UdpProtocol, MAX_CHECKSUM_HISTORY_SIZE};
@@ -117,8 +118,10 @@ where
 {
     /// The number of players of the session.
     num_players: usize,
-    /// The maximum number of frames GGRS will roll back. Every gamestate older than this is guaranteed to be correct.
+    /// The maximum number of frames GGRS will predict ahead of the last confirmed frame.
     max_prediction: usize,
+    /// The number of past frames retained for rollbacks (at least `max_prediction`).
+    max_rollback: usize,
     /// The sync layer handles player input queues and provides predictions.
     sync_layer: SyncLayer<T>,
     /// With sparse saving, the session will only request to save the minimum confirmed frame.
@@ -180,6 +183,8 @@ impl<T: Config> P2PSession<T> {
     pub(crate) fn new(
         num_players: usize,
         max_prediction: usize,
+        max_rollback: usize,
+        input_queue_len: usize,
         socket: Box<dyn NonBlockingSocket<T::Address>>,
         players: PlayerRegistry<T>,
         sparse_saving: bool,
@@ -190,6 +195,8 @@ impl<T: Config> P2PSession<T> {
         disconnect_timeout: Duration,
         disconnect_notify_start: Duration,
     ) -> Self {
+        let max_rollback = max_rollback.max(max_prediction);
+
         // local connection status
         let mut local_connect_status = Vec::new();
         for _ in 0..num_players {
@@ -197,7 +204,7 @@ impl<T: Config> P2PSession<T> {
         }
 
         // sync layer & set input delay
-        let mut sync_layer = SyncLayer::new(num_players, max_prediction);
+        let mut sync_layer = SyncLayer::new(num_players, max_rollback, input_queue_len);
         for (player_handle, player_type) in &players.handles {
             if matches!(player_type, PlayerType::Local) {
                 sync_layer.set_frame_delay(*player_handle, input_delay);
@@ -228,6 +235,7 @@ impl<T: Config> P2PSession<T> {
             state,
             num_players,
             max_prediction,
+            max_rollback,
             fps,
             sparse_saving,
             socket,
@@ -299,6 +307,7 @@ impl<T: Config> P2PSession<T> {
     /// - Returns [`InvalidRequest`] if a local input is missing for any registered local player.
     /// - Returns [`NotSynchronized`] if the session is not yet synchronized with remote peers.
     /// - Returns [`PredictionThreshold`] (rollback mode only) if the remote peer is too far behind.
+    /// - Returns [`RollbackOutOfWindow`] if a peer's disconnect requires rolling back further than the session retains.
     ///
     /// [`poll_remote_clients`]: Self::poll_remote_clients
     /// [`advance_frame_with_wait`]: Self::advance_frame_with_wait
@@ -306,6 +315,7 @@ impl<T: Config> P2PSession<T> {
     /// [`InvalidRequest`]: GgrsError::InvalidRequest
     /// [`NotSynchronized`]: GgrsError::NotSynchronized
     /// [`PredictionThreshold`]: GgrsError::PredictionThreshold
+    /// [`RollbackOutOfWindow`]: GgrsError::RollbackOutOfWindow
     pub fn advance_frame(&mut self) -> Result<Vec<GgrsRequest<T>>, GgrsError> {
         // receive info from remote players, trigger events and send messages
         self.poll_remote_clients();
@@ -414,7 +424,7 @@ impl<T: Config> P2PSession<T> {
         if lockstep {
             self.advance_lockstep_frame(&mut requests);
         } else {
-            self.advance_rollback_frame(&mut requests);
+            self.advance_rollback_frame(&mut requests)?;
         }
 
         /*
@@ -583,9 +593,11 @@ impl<T: Config> P2PSession<T> {
     /// When increasing delay, the last known input is replicated to fill the created gap.
     ///
     /// # Errors
-    /// - Returns [`InvalidRequest`] if the handle does not refer to a local player.
+    /// - Returns [`InvalidRequest`] if the handle does not refer to a local player, or if the delay
+    ///   exceeds what the input queue was sized for (see [`with_max_input_delay`]).
     ///
     /// [`InvalidRequest`]: GgrsError::InvalidRequest
+    /// [`with_max_input_delay`]: crate::SessionBuilder::with_max_input_delay
     pub fn set_input_delay(
         &mut self,
         player_handle: PlayerHandle,
@@ -593,6 +605,15 @@ impl<T: Config> P2PSession<T> {
     ) -> Result<(), GgrsError> {
         match self.player_reg.handles.get(&player_handle) {
             Some(PlayerType::Local) => {
+                let capacity = self.sync_layer.input_queue_capacity();
+                if input_queue_length(self.max_rollback, self.max_prediction, delay) > capacity {
+                    return Err(GgrsError::InvalidRequest {
+                        info: format!(
+                            "Input delay {delay} does not fit the input queue of {capacity} frames, declare it with `with_max_input_delay` when building the session."
+                        ),
+                    });
+                }
+
                 let fills = self.sync_layer.set_frame_delay(player_handle, delay);
 
                 // When delay increases, the InputQueue silently replicates the last input to fill
@@ -681,6 +702,11 @@ impl<T: Config> P2PSession<T> {
     /// Returns the maximum prediction window of a session.
     pub fn max_prediction(&self) -> usize {
         self.max_prediction
+    }
+
+    /// Returns the number of past frames the session retains for rollbacks.
+    pub fn max_rollback(&self) -> usize {
+        self.max_rollback
     }
 
     /// Returns true if the session is running in lockstep mode.
@@ -845,12 +871,28 @@ impl<T: Config> P2PSession<T> {
                 for &handle in endpoint.handles() {
                     self.local_connect_status[handle].disconnected = true;
                 }
+                let first_disconnect = !endpoint.is_disconnected();
                 endpoint.disconnect();
+
+                // Peers converge on the smallest last frame anyone received from this player
+                let status = &mut self.local_connect_status[player_handle];
+                let last_frame = std::cmp::min(status.last_frame, last_frame);
+                status.last_frame = last_frame;
 
                 if self.sync_layer.current_frame() > last_frame + 1 {
                     // remember to adjust simulation to account for the fact that the player disconnected a few frames ago,
                     // resimulating with correct disconnect flags (to account for user having some AI kick in).
-                    self.disconnect_frame = last_frame + 1;
+                    let rollback_to = last_frame + 1;
+                    self.disconnect_frame = if self.disconnect_frame == NULL_FRAME {
+                        rollback_to
+                    } else {
+                        std::cmp::min(self.disconnect_frame, rollback_to)
+                    };
+                }
+
+                if first_disconnect {
+                    self.event_queue
+                        .push_back(GgrsEvent::Disconnected { addr: addr.clone() });
                 }
             }
             PlayerType::Spectator(addr) => {
@@ -859,7 +901,13 @@ impl<T: Config> P2PSession<T> {
                     .spectators
                     .get_mut(addr)
                     .expect("There should be no address without registered endpoint");
+                let first_disconnect = !endpoint.is_disconnected();
                 endpoint.disconnect();
+
+                if first_disconnect {
+                    self.event_queue
+                        .push_back(GgrsEvent::Disconnected { addr: addr.clone() });
+                }
             }
             PlayerType::Local => (),
         }
@@ -941,12 +989,15 @@ impl<T: Config> P2PSession<T> {
     /// up to `max_prediction` frames ahead of the last confirmed frame.
     /// NULL_FRAME for `last_confirmed_frame` is treated as 0 frames ahead so prediction can
     /// start immediately from frame 0 without any prior confirmation.
-    fn advance_rollback_frame(&mut self, requests: &mut Vec<GgrsRequest<T>>) {
+    fn advance_rollback_frame(
+        &mut self,
+        requests: &mut Vec<GgrsRequest<T>>,
+    ) -> Result<(), GgrsError> {
         // find the confirmed frame for which we received all inputs
         let confirmed_frame = self.confirmed_frame();
 
         // check game consistency and roll back, if necessary
-        self.handle_rollback_and_save(confirmed_frame, requests);
+        self.handle_rollback_and_save(confirmed_frame, requests)?;
 
         // send confirmed inputs to spectators before throwing them away
         self.send_confirmed_inputs_to_spectators(confirmed_frame);
@@ -975,6 +1026,8 @@ impl<T: Config> P2PSession<T> {
                 self.sync_layer.current_frame()
             );
         }
+
+        Ok(())
     }
 
     /// Roll back to `min_confirmed` frame and resimulate the game with most up-to-date input data.
@@ -982,21 +1035,23 @@ impl<T: Config> P2PSession<T> {
         &mut self,
         confirmed_frame: Frame,
         requests: &mut Vec<GgrsRequest<T>>,
-    ) {
+    ) -> Result<(), GgrsError> {
         let first_incorrect = self
             .sync_layer
             .check_simulation_consistency(self.disconnect_frame);
         if first_incorrect != NULL_FRAME {
-            self.adjust_gamestate(first_incorrect, confirmed_frame, requests);
+            self.adjust_gamestate(first_incorrect, confirmed_frame, requests)?;
             self.disconnect_frame = NULL_FRAME;
         }
 
         let last_saved = self.sync_layer.last_saved_frame();
         if self.sparse_saving {
-            self.check_last_saved_state(last_saved, confirmed_frame, requests);
+            self.check_last_saved_state(last_saved, confirmed_frame, requests)?;
         } else {
             requests.push(self.sync_layer.save_current_state());
         }
+
+        Ok(())
     }
 
     fn adjust_gamestate(
@@ -1004,7 +1059,7 @@ impl<T: Config> P2PSession<T> {
         first_incorrect: Frame,
         min_confirmed: Frame,
         requests: &mut Vec<GgrsRequest<T>>,
-    ) {
+    ) -> Result<(), GgrsError> {
         let current_frame = self.sync_layer.current_frame();
         // determine the frame to load
         let frame_to_load = if self.sparse_saving {
@@ -1014,6 +1069,17 @@ impl<T: Config> P2PSession<T> {
             // otherwise, we will rollback to first_incorrect
             first_incorrect
         };
+
+        if !self
+            .sync_layer
+            .can_load_frame(frame_to_load, &self.local_connect_status)
+        {
+            return Err(GgrsError::RollbackOutOfWindow {
+                frame_to_load,
+                current_frame,
+                rollback_window: self.max_rollback,
+            });
+        }
 
         // we should always load a frame that is before or exactly the first incorrect frame
         assert!(frame_to_load <= first_incorrect);
@@ -1055,6 +1121,8 @@ impl<T: Config> P2PSession<T> {
         }
         // after all this, we should have arrived at the same frame where we started
         assert_eq!(self.sync_layer.current_frame(), current_frame);
+
+        Ok(())
     }
 
     /// For each spectator, send all confirmed input up until the minimum confirmed frame.
@@ -1208,7 +1276,7 @@ impl<T: Config> P2PSession<T> {
         last_saved: Frame,
         confirmed_frame: Frame,
         requests: &mut Vec<GgrsRequest<T>>,
-    ) {
+    ) -> Result<(), GgrsError> {
         // in sparse saving mode, we need to make sure not to lose the last saved frame
         if self.sync_layer.current_frame() - last_saved >= self.max_prediction as i32 {
             // check if the current frame is confirmed, otherwise we need to roll back
@@ -1217,7 +1285,7 @@ impl<T: Config> P2PSession<T> {
                 requests.push(self.sync_layer.save_current_state());
             } else {
                 // roll back to the last saved state, resimulate and save on the way
-                self.adjust_gamestate(last_saved, confirmed_frame, requests);
+                self.adjust_gamestate(last_saved, confirmed_frame, requests)?;
             }
 
             // after all this, we should have saved the confirmed state
@@ -1227,6 +1295,8 @@ impl<T: Config> P2PSession<T> {
                         == std::cmp::min(confirmed_frame, self.sync_layer.current_frame())
             );
         }
+
+        Ok(())
     }
 
     /// Handle events received from the UDP endpoints. Most events are being forwarded to the user for notification, but some require action.
@@ -1259,7 +1329,7 @@ impl<T: Config> P2PSession<T> {
                 self.check_initial_sync();
                 self.event_queue.push_back(GgrsEvent::Synchronized { addr });
             }
-            // disconnect the player, then forward to user
+            // disconnect the player; `disconnect_player_at_frame` forwards the event to the user
             Event::Disconnected => {
                 for handle in player_handles {
                     let last_frame = if handle < self.num_players as PlayerHandle {
@@ -1270,8 +1340,6 @@ impl<T: Config> P2PSession<T> {
 
                     self.disconnect_player_at_frame(handle, last_frame);
                 }
-
-                self.event_queue.push_back(GgrsEvent::Disconnected { addr });
             }
             // add the input and all associated information
             Event::Input { input, player } => {

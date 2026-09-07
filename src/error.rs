@@ -39,6 +39,16 @@ pub enum GgrsError {
     /// [`network_stats`]: crate::P2PSession::network_stats
     /// [`Running`]: crate::SessionState::Running
     NotEnoughData,
+    /// A rollback was required to a frame whose saved state or inputs are no longer retained,
+    /// typically because a peer registered a disconnect further in the past than we can rewind.
+    RollbackOutOfWindow {
+        /// The frame the session would have to load.
+        frame_to_load: Frame,
+        /// The current frame of the session.
+        current_frame: Frame,
+        /// The number of past frames the session retains for rollbacks.
+        rollback_window: usize,
+    },
 }
 
 impl Display for GgrsError {
@@ -78,6 +88,16 @@ impl Display for GgrsError {
                 write!(
                     f,
                     "Not enough data has been collected yet. Retry after at least one second."
+                )
+            }
+            Self::RollbackOutOfWindow {
+                frame_to_load,
+                current_frame,
+                rollback_window,
+            } => {
+                write!(
+                    f,
+                    "cannot roll back to frame {frame_to_load}: outside of rollback window (current frame {current_frame}, rollback window {rollback_window})"
                 )
             }
         }

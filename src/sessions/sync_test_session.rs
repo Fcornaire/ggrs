@@ -58,13 +58,14 @@ impl<T: Config> SyncTestSession<T> {
         max_prediction: usize,
         check_distance: usize,
         input_delay: usize,
+        input_queue_len: usize,
     ) -> Self {
         let mut dummy_connect_status = Vec::new();
         for _ in 0..num_players {
             dummy_connect_status.push(ConnectionStatus::default());
         }
 
-        let mut sync_layer = SyncLayer::new(num_players, max_prediction);
+        let mut sync_layer = SyncLayer::new(num_players, max_prediction, input_queue_len);
         for i in 0..num_players {
             sync_layer.set_frame_delay(i, input_delay);
         }
