@@ -536,6 +536,7 @@ impl<T: Config> P2PSession<T> {
             self.num_players,
             self.num_players,
             self.max_prediction,
+            self.sync_layer.input_queue_capacity(),
             self.disconnect_timeout,
             self.disconnect_notify_start,
             self.fps,

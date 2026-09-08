@@ -20,6 +20,7 @@ use super::network_stats::NetworkStats;
 
 const NUM_SYNC_PACKETS: u32 = 5;
 const UDP_SHUTDOWN_TIMER: u64 = 5000;
+/// Floor for the unacknowledged input queue, scale with their input queue length.
 const PENDING_OUTPUT_SIZE: usize = 128;
 /// How often to re-send handshake packets while waiting for the remote to respond.
 /// Only active during the synchronization phase (typically < 1 second).
@@ -185,6 +186,7 @@ where
 
     // input compression
     pending_output: VecDeque<InputBytes>,
+    pending_output_capacity: usize,
     last_acked_input: InputBytes,
     max_prediction: usize,
     recv_inputs: HashMap<Frame, InputBytes>,
@@ -220,11 +222,14 @@ impl<T: Config> UdpProtocol<T> {
         num_players: usize,
         local_players: usize,
         max_prediction: usize,
+        pending_output_capacity: usize,
         disconnect_timeout: Duration,
         disconnect_notify_start: Duration,
         fps: usize,
         desync_detection: DesyncDetection,
     ) -> Self {
+        let pending_output_capacity = pending_output_capacity.max(PENDING_OUTPUT_SIZE);
+
         let mut magic = rand::random::<u16>();
         while magic == 0 {
             magic = rand::random::<u16>();
@@ -271,7 +276,8 @@ impl<T: Config> UdpProtocol<T> {
             peer_connect_status,
 
             // input compression
-            pending_output: VecDeque::with_capacity(PENDING_OUTPUT_SIZE),
+            pending_output: VecDeque::with_capacity(pending_output_capacity),
+            pending_output_capacity,
             last_acked_input: InputBytes::zeroed::<T>(local_players),
             max_prediction,
             recv_inputs,
@@ -512,9 +518,8 @@ impl<T: Config> UdpProtocol<T> {
 
         self.pending_output.push_back(endpoint_data);
 
-        // we should never have so much pending input for a remote player (if they didn't ack, we should stop at MAX_PREDICTION_THRESHOLD)
-        // this is a spectator that didn't ack our input, we just disconnect them
-        if self.pending_output.len() > PENDING_OUTPUT_SIZE {
+        // a peer that stops acking for a whole input queue worth of frames is gone
+        if self.pending_output.len() > self.pending_output_capacity {
             self.event_queue.push_back(Event::Disconnected);
         }
 
@@ -872,12 +877,21 @@ mod protocol_tests {
     }
 
     fn running_protocol(handles: Vec<PlayerHandle>, num_players: usize) -> UdpProtocol<TestConfig> {
+        running_protocol_with_capacity(handles, num_players, PENDING_OUTPUT_SIZE)
+    }
+
+    fn running_protocol_with_capacity(
+        handles: Vec<PlayerHandle>,
+        num_players: usize,
+        pending_output_capacity: usize,
+    ) -> UdpProtocol<TestConfig> {
         let mut protocol = UdpProtocol::new(
             handles,
             localhost(9000),
             num_players,
             1,
             8,
+            pending_output_capacity,
             Duration::from_millis(2000),
             Duration::from_millis(500),
             60,
@@ -892,6 +906,42 @@ mod protocol_tests {
             header: MessageHeader { magic: 0 },
             body: MessageBody::Input(body),
         }
+    }
+
+    #[test]
+    fn pending_output_cap_scales_with_capacity() {
+        let status = vec![ConnectionStatus::default(); 1];
+        let input = || bincode::serialize(&TestInput { inp: 0 }).unwrap();
+        let disconnected = |protocol: &UdpProtocol<TestConfig>| {
+            protocol
+                .event_queue
+                .iter()
+                .any(|event| matches!(event, Event::Disconnected))
+        };
+
+        let mut scaled = running_protocol_with_capacity(vec![0], 1, 4 * PENDING_OUTPUT_SIZE);
+        for frame in 0..2 * PENDING_OUTPUT_SIZE as Frame {
+            scaled.send_input_bytes(
+                InputBytes {
+                    frame,
+                    bytes: input(),
+                },
+                &status,
+            );
+        }
+        assert!(!disconnected(&scaled));
+
+        let mut floored = running_protocol_with_capacity(vec![0], 1, 1);
+        for frame in 0..=PENDING_OUTPUT_SIZE as Frame {
+            floored.send_input_bytes(
+                InputBytes {
+                    frame,
+                    bytes: input(),
+                },
+                &status,
+            );
+        }
+        assert!(disconnected(&floored));
     }
 
     #[test]
