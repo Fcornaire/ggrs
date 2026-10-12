@@ -22,7 +22,7 @@ use std::convert::TryInto;
 const RECOMMENDATION_INTERVAL: Frame = 60;
 const MIN_RECOMMENDATION: u32 = 3;
 
-const SPECTATOR_SEND_WINDOW: usize = 64;
+const SPECTATOR_SEND_WINDOW: usize = 240;
 
 pub(crate) struct PlayerRegistry<T>
 where
@@ -1187,13 +1187,13 @@ impl<T: Config> P2PSession<T> {
                 continue;
             }
 
-            while *cursor < goal {
-                endpoint.send_input_bytes(
-                    self.input_history[*cursor as usize].clone(),
-                    &self.local_connect_status,
-                );
-                *cursor += 1;
-            }
+            endpoint.send_input_batch(
+                self.input_history[*cursor as usize..goal as usize]
+                    .iter()
+                    .cloned(),
+                &self.local_connect_status,
+            );
+            *cursor = goal;
 
             endpoint.send_all_messages(&mut self.socket);
         }

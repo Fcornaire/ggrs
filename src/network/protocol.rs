@@ -505,18 +505,28 @@ impl<T: Config> UdpProtocol<T> {
         endpoint_data: InputBytes,
         connect_status: &[ConnectionStatus],
     ) {
+        self.send_input_batch(std::iter::once(endpoint_data), connect_status);
+    }
+
+    pub(crate) fn send_input_batch(
+        &mut self,
+        inputs: impl IntoIterator<Item = InputBytes>,
+        connect_status: &[ConnectionStatus],
+    ) {
         if self.state != ProtocolState::Running {
             return;
         }
 
-        // register the input and advantages in the time sync layer
-        self.time_sync_layer.advance_frame(
-            endpoint_data.frame,
-            self.local_frame_advantage,
-            self.remote_frame_advantage,
-        );
+        for endpoint_data in inputs {
+            // register the input and advantages in the time sync layer
+            self.time_sync_layer.advance_frame(
+                endpoint_data.frame,
+                self.local_frame_advantage,
+                self.remote_frame_advantage,
+            );
 
-        self.pending_output.push_back(endpoint_data);
+            self.pending_output.push_back(endpoint_data);
+        }
 
         // a peer that stops acking for a whole input queue worth of frames is gone
         if self.pending_output.len() > self.pending_output_capacity {
@@ -942,6 +952,21 @@ mod protocol_tests {
             );
         }
         assert!(disconnected(&floored));
+    }
+
+    #[test]
+    fn input_batch_is_sent_as_one_message() {
+        let status = vec![ConnectionStatus::default(); 1];
+        let mut protocol = running_protocol(vec![0], 1);
+        let inputs = (0..10).map(|frame| InputBytes {
+            frame,
+            bytes: bincode::serialize(&TestInput { inp: frame as u8 }).unwrap(),
+        });
+
+        protocol.send_input_batch(inputs, &status);
+
+        assert_eq!(protocol.pending_output_len(), 10);
+        assert_eq!(protocol.send_queue.len(), 1);
     }
 
     #[test]
