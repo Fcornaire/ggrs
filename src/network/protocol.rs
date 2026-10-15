@@ -37,6 +37,8 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(200);
 /// Drives the rolling RTT and frame-advantage estimates exposed by `network_stats()`;
 /// at 200 ms this gives ~5 stat updates per second.
 const QUALITY_REPORT_INTERVAL: Duration = Duration::from_millis(200);
+
+const INPUT_ACK_DELAY_FRAMES: u32 = 2;
 /// Number of old checksums to keep in memory
 pub const MAX_CHECKSUM_HISTORY_SIZE: usize = 32;
 
@@ -171,6 +173,7 @@ where
     running_last_input_recv: Instant,
     disconnect_notify_sent: bool,
     disconnect_event_sent: bool,
+    pending_ack_since: Option<Instant>,
 
     // constants
     disconnect_timeout: Duration,
@@ -262,6 +265,7 @@ impl<T: Config> UdpProtocol<T> {
             running_last_input_recv: Instant::now(),
             disconnect_notify_sent: false,
             disconnect_event_sent: false,
+            pending_ack_since: None,
 
             // constants
             disconnect_timeout,
@@ -400,6 +404,12 @@ impl<T: Config> UdpProtocol<T> {
                 if self.running_last_input_recv + RUNNING_RETRY_INTERVAL < now {
                     self.send_pending_output(connect_status);
                     self.running_last_input_recv = Instant::now();
+                }
+
+                // acknowledge received inputs on their own if no input packet carried the ack
+                let ack_delay = self.input_ack_delay();
+                if matches!(self.pending_ack_since, Some(since) if since + ack_delay <= now) {
+                    self.send_input_ack();
                 }
 
                 // periodically send a quality report
@@ -569,15 +579,22 @@ impl<T: Config> UdpProtocol<T> {
             connect_status.clone_into(&mut body.peer_connect_status);
 
             self.queue_message(MessageBody::Input(body));
+            self.pending_ack_since = None;
         }
     }
 
     fn send_input_ack(&mut self) {
+        self.pending_ack_since = None;
+
         let body = InputAck {
             ack_frame: self.last_recv_frame(),
         };
 
         self.queue_message(MessageBody::InputAck(body));
+    }
+
+    fn input_ack_delay(&self) -> Duration {
+        Duration::from_secs(u64::from(INPUT_ACK_DELAY_FRAMES)) / self.fps.max(1) as u32
     }
 
     fn send_keep_alive(&mut self) {
@@ -791,8 +808,8 @@ impl<T: Config> UdpProtocol<T> {
                 }
             }
 
-            // send an input ack
-            self.send_input_ack();
+            // acknowledged by the next input packet or alone from `poll`
+            self.pending_ack_since.get_or_insert_with(Instant::now);
 
             // delete received inputs that are too old
             let last_recv_frame = self.last_recv_frame();
@@ -916,6 +933,28 @@ mod protocol_tests {
             header: MessageHeader { magic: 0 },
             body: MessageBody::Input(body),
         }
+    }
+
+    fn receive_first_input(protocol: &mut UdpProtocol<TestConfig>) {
+        let reference = protocol
+            .recv_inputs
+            .get(&NULL_FRAME)
+            .expect("blank reference input should exist")
+            .bytes
+            .clone();
+
+        let input_bytes = bincode::serialize(&TestInput { inp: 1 }).unwrap();
+
+        let msg = input_message(Input {
+            peer_connect_status: vec![ConnectionStatus::default(); 1],
+            disconnect_requested: false,
+            start_frame: 0,
+            ack_frame: NULL_FRAME,
+            bytes: encode(&reference, [input_bytes].iter()),
+        });
+
+        protocol.handle_message(&msg);
+        assert_eq!(protocol.last_recv_frame(), 0);
     }
 
     #[test]
@@ -1062,5 +1101,50 @@ mod protocol_tests {
 
         assert_eq!(protocol.last_recv_frame(), NULL_FRAME);
         assert!(protocol.event_queue.is_empty());
+    }
+
+    #[test]
+    fn received_input_is_acked_by_the_next_input_packet() {
+        let status = vec![ConnectionStatus::default(); 1];
+        let mut protocol = running_protocol(vec![0], 1);
+
+        receive_first_input(&mut protocol);
+        assert!(protocol.send_queue.is_empty());
+
+        protocol.send_input_bytes(
+            InputBytes {
+                frame: 0,
+                bytes: bincode::serialize(&TestInput { inp: 2 }).unwrap(),
+            },
+            &status,
+        );
+        assert!(protocol.pending_ack_since.is_none());
+        let _ = protocol.poll(&status);
+
+        assert_eq!(protocol.send_queue.len(), 1);
+        assert!(matches!(
+            &protocol.send_queue[0].body,
+            MessageBody::Input(body) if body.ack_frame == 0
+        ));
+    }
+
+    #[test]
+    fn received_input_is_acked_alone_when_no_input_is_sent() {
+        let status = vec![ConnectionStatus::default(); 1];
+        let mut protocol = running_protocol(vec![0], 1);
+
+        receive_first_input(&mut protocol);
+        let _ = protocol.poll(&status);
+        assert!(protocol.send_queue.is_empty());
+
+        protocol.pending_ack_since = Instant::now().checked_sub(Duration::from_secs(1));
+        let _ = protocol.poll(&status);
+
+        assert_eq!(protocol.send_queue.len(), 1);
+        assert!(matches!(
+            &protocol.send_queue[0].body,
+            MessageBody::InputAck(body) if body.ack_frame == 0
+        ));
+        assert!(protocol.pending_ack_since.is_none());
     }
 }
